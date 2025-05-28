@@ -1,8 +1,21 @@
 import gradio as gr
+import traceback
+import logging
 import utils
+import sys
 import os
 
 from wan_model import WANModel
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("videogen.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("videogen-webui")
 
 MODELS_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 
@@ -21,32 +34,55 @@ def load_model(resolution="480p"):
 
 def generate_video(
     prompt,
+    resolution="480p",
     enhance_prompt=True,
-    negative_prompt="low quality, blurry, bad hands, bad face, poor lighting",
     guidance_scale=7.5,
-    num_frames=81,
+    num_inference_steps=25,
+    motion_bucket_id=127,
     fps=16,
     progress=gr.Progress()
 ):
-    """Generate video based on text prompt"""
+    """Generate video based on text prompt using the WAN model"""
     if enhance_prompt:
         prompt = utils.enhance_prompt(prompt, strength="medium")
     
-    progress(0.1, desc="Starting generation...")
-    
-    video_frames, status_message = wan_model.generate(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        guidance_scale=guidance_scale,
-        num_frames=num_frames,
-        progress_callback=progress
-    )
-    
-    if video_frames is None:
-        return None, status_message
-    
-    progress(0.9, desc="Converting to video...")
-    video_path, conversion_status = utils.frames_to_video(video_frames, fps=fps)
+    try:
+        logger.info(f"Setting model resolution to {resolution}")
+        wan_model.load_model(resolution)
+        
+        width, height = wan_model.get_dimensions()
+        
+        logger.info(f"Starting video generation with prompt: {prompt}")
+        progress(0.1, desc="Starting generation...")
+        
+        video_frames, status_message = wan_model.generate(
+            prompt=prompt,
+            width=width,
+            height=height,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps,
+            motion_bucket_id=motion_bucket_id,
+            progress_callback=lambda p: progress(0.1 + p * 0.8)
+        )
+        
+        if video_frames is None:
+            logger.error(f"Video generation failed: {status_message}")
+            return None, status_message
+        
+        logger.info(f"App received video_frames with shape: {video_frames.shape if hasattr(video_frames, 'shape') else 'unknown'}")
+        
+        progress(0.9, desc="Converting to video...")
+        video_path, conversion_status = utils.frames_to_video(video_frames, fps=fps)
+        
+        if video_path and os.path.exists(video_path):
+            logger.info(f"Video saved to {video_path} ({conversion_status})")
+        else:
+            logger.error(f"Video path does not exist: {video_path} ({conversion_status})")
+            return None, f"Error: Video file not created properly. {conversion_status}"
+    except Exception as e:
+        logger.error(f"Error in generate_video: {str(e)}")
+        logger.error(traceback.format_exc())
+        return None, f"Error generating video: {str(e)}"
     
     metadata = utils.create_video_info_metadata(
         prompt=prompt,
@@ -54,13 +90,14 @@ def generate_video(
         resolution=wan_model.resolution,
         params={
             "guidance_scale": guidance_scale,
-            "num_frames": num_frames,
+            "num_inference_steps": num_inference_steps,
+            "motion_bucket_id": motion_bucket_id,
             "fps": fps
         }
     )
     
     progress(1.0, desc="Done!")
-    return video_path, f"Generated video with {num_frames} frames at {fps} FPS"
+    return video_path, f"Generated video with WAN 2.1 model at {fps} FPS"
 
 def build_ui():
     """Build the Gradio interface"""
@@ -93,13 +130,7 @@ def build_ui():
                                 value=True,
                                 info="Add quality boosting terms to your prompt"
                             )
-                            negative_prompt = gr.Textbox(
-                                label="Negative Prompt", 
-                                placeholder="What you don't want to see in the video...",
-                                value="low quality, blurry, bad hands, bad face, poor lighting",
-                                lines=2
-                            )
-                        
+
                         with gr.Group():
                             gr.Markdown("### Generation Parameters")
                             with gr.Row():
@@ -112,13 +143,22 @@ def build_ui():
                                     info="How closely to follow the prompt (higher = more faithful but less creative)"
                                 )
                             with gr.Row():
-                                num_frames = gr.Slider(
-                                    label="Number of Frames", 
-                                    minimum=16, 
-                                    maximum=128, 
-                                    value=81, 
+                                num_inference_steps = gr.Slider(
+                                    label="Inference Steps", 
+                                    minimum=10, 
+                                    maximum=50, 
+                                    value=25, 
                                     step=1,
-                                    info="WAN recommended default: 81"
+                                    info="Number of steps for diffusion process. More steps = better quality but slower"
+                                )
+                                
+                                motion_bucket_id = gr.Slider(
+                                    label="Motion Intensity", 
+                                    minimum=1, 
+                                    maximum=255, 
+                                    value=127, 
+                                    step=1,
+                                    info="Controls the amount of motion in the video. Higher = more motion"
                                 )
                                 fps = gr.Slider(
                                     label="FPS", 
@@ -159,10 +199,11 @@ def build_ui():
             fn=generate_video,
             inputs=[
                 prompt,
+                resolution,
                 enhance_prompt,
-                negative_prompt,
                 guidance_scale,
-                num_frames,
+                num_inference_steps,
+                motion_bucket_id,
                 fps
             ],
             outputs=[
